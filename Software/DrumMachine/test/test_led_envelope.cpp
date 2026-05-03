@@ -11,12 +11,20 @@
 // Plus a small "past-pattern returns 0" case noted in the task brief's
 // "Notes / risks".
 //
+// Task 05 additions (DrumPad-driven LED-wiring tests):
+//   7. Pad press lights the LED via MockLed (Fire path).
+//   8. Pad hold-toggle drives the PulseConfirm pattern via MockLed.
+//
 // Per task brief: never hard-code 50/120 ms; always use Config constants so
 // the tests survive any reasonable retune of the timings.
 
 #include "Config.h"
+#include "DrumPad.h"
+#include "MockButton.h"
+#include "MockLed.h"
+#include "MockRng.h"
+#include "StubInstrument.h"
 #include "test_macros.h"
-#include "util/LedTrigger.h"
 
 namespace {
 
@@ -175,4 +183,114 @@ TEST_CASE("LedTrigger second Fire restarts the envelope") {
 
     // Peak of the new envelope at kReFire + kLedAttackMs.
     EXPECT_NEAR(trig.Brightness(kReFire + Config::kLedAttackMs), 1.0f, kEps);
+}
+
+// --- Task 05 additions: DrumPad-driven LED wiring tests ------------------
+
+namespace {
+
+// Helper duplicated from test_drum_pad.cpp (header-only sharing isn't worth
+// it for two callsites). Drives the pad through one Tick at nowMs while
+// threading the timestamp into MockLed so its history is properly tagged.
+void PadTickAt(drum_machine::DrumPad& pad, MockLed& led, uint32_t nowMs) {
+    led.SetNow(nowMs);
+    pad.Tick(nowMs);
+}
+
+// Returns true iff the MockLed history contains at least one sample equal to
+// `value` (within eps) whose timestamp lies in [tMin, tMax].
+bool LedHasValueInWindow(const MockLed& led, float value, float eps,
+                         uint32_t tMin, uint32_t tMax) {
+    for (const auto& [ts, v] : led.BrightnessHistory()) {
+        if (ts >= tMin && ts <= tMax) {
+            const float d = v - value;
+            const float a = d < 0 ? -d : d;
+            if (a <= eps) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+// 7. Pad press lights the LED via MockLed (Fire path). Confirms wiring, not
+//    the math (math lives in tests 1–6 above). Per the task 05 brief:
+//    "press at t=0; sample MockLed::Last() at t=2 ms (mid-attack assuming
+//    kLedAttackMs=5) and assert > 0." We perform a no-op clearing Tick first
+//    so the boot-stuck-button mask doesn't fire on the press, and we sample
+//    mid-attack relative to the actual press time.
+TEST_CASE("DrumPad press lights the LED via MockLed (wiring test)") {
+    MockButton            button;
+    MockLed               led;
+    StubInstrument        instrument;
+    MockRng               rng(101);
+    drum_machine::DrumPad pad(button, led, instrument, rng);
+
+    // Clear the first-tick-after-init flag with the button still up so the
+    // boot-stuck mask is NOT raised when we press below.
+    PadTickAt(pad, led, 0);
+
+    // Press the button. Pick a press time and sample time inside the attack
+    // ramp using Config::kLedAttackMs so the test survives any retune.
+    const uint32_t kPressAt    = 10;
+    const uint32_t kAttackMs   = Config::kLedAttackMs;
+    // Sample point inside the attack ramp. For kLedAttackMs >= 2 this lands
+    // at the midpoint or just below it; for kLedAttackMs == 1 it lands at
+    // the peak — still > 0 in both cases.
+    const uint32_t kSampleOff  = (kAttackMs > 1) ? kAttackMs / 2 : 1;
+
+    button.ScriptPress(kPressAt);
+    // Tick once at the press time so the press is consumed and Fire runs.
+    PadTickAt(pad, led, kPressAt);
+    // Tick again at the sample point so MockLed::Last() reflects mid-attack.
+    PadTickAt(pad, led, kPressAt + kSampleOff);
+
+    EXPECT_GT(led.Last(), 0.0f);
+}
+
+// 8. Pad hold-toggle drives the PulseConfirm pattern via MockLed. We hold the
+//    button just past the threshold and assert the LED history contains both
+//    a 1.0 sample inside the first "on" segment and a 0.0 sample inside the
+//    first gap of the pulse pattern that starts at the toggle moment.
+TEST_CASE("DrumPad hold-toggle drives PulseConfirm pattern on the LED") {
+    MockButton            button;
+    MockLed               led;
+    StubInstrument        instrument;
+    MockRng               rng(102);
+    drum_machine::DrumPad pad(button, led, instrument, rng);
+
+    PadTickAt(pad, led, 0);  // clear first-tick flag (button still up).
+
+    const uint32_t kPressAt   = 10;
+    const uint32_t kPulseTotal =
+        static_cast<uint32_t>(Config::kPulseConfirmCount) *
+        (Config::kPulseConfirmOnMs + Config::kPulseConfirmGapMs);
+    // Hold long enough that the toggle fires AND the full pulse pattern has
+    // had time to play out before release.
+    const uint32_t kReleaseAt = kPressAt + Config::kHoldThresholdMs +
+                                kPulseTotal + 20;
+
+    button.ScriptPress(kPressAt);
+    button.ScriptRelease(kReleaseAt);
+    for (uint32_t t = 1; t <= kReleaseAt; ++t) {
+        PadTickAt(pad, led, t);
+    }
+
+    // The pulse pattern starts at the moment the threshold is crossed.
+    // Because we tick once per ms and the press lands at kPressAt, the
+    // hold-toggle fires at kPressAt + kHoldThresholdMs.
+    const uint32_t pulseStart = kPressAt + Config::kHoldThresholdMs;
+    const uint32_t kOn        = Config::kPulseConfirmOnMs;
+    const uint32_t kGap       = Config::kPulseConfirmGapMs;
+
+    // Assert the LED was driven HIGH inside the first "on" segment.
+    EXPECT_TRUE(LedHasValueInWindow(led, 1.0f, 1e-4f,
+                                    pulseStart + kOn / 4,
+                                    pulseStart + (3 * kOn) / 4));
+    // Assert the LED was driven LOW inside the first gap.
+    EXPECT_TRUE(LedHasValueInWindow(led, 0.0f, 1e-4f,
+                                    pulseStart + kOn + kGap / 4,
+                                    pulseStart + kOn + (3 * kGap) / 4));
 }
