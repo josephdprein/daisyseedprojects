@@ -15,6 +15,24 @@ CXX      := g++
 CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -DDRUMMACHINE_HOST_TEST
 INCLUDES := -Isrc -Itest/support
 
+# DaisySP source tree. Voices include their internal headers two ways:
+#   - via the public path (e.g. "Drums/analogbassdrum.h") — root Source/ entry
+#     covers this.
+#   - via a bare filename (e.g. "dsp.h", "svf.h") — the .cpp files reference
+#     siblings without a path, so each subdirectory used by the picked voices
+#     must also be on the include path.
+# All paths use -isystem so DaisySP's own diagnostics aren't promoted to errors
+# by -Werror in this build.
+DAISYSP_DIR     := ../GuitarPedal/dependencies/DaisySP/Source
+DAISYSP_INCLUDE := -isystem $(DAISYSP_DIR) \
+                   -isystem $(DAISYSP_DIR)/Drums \
+                   -isystem $(DAISYSP_DIR)/Filters \
+                   -isystem $(DAISYSP_DIR)/Noise \
+                   -isystem $(DAISYSP_DIR)/PhysicalModeling \
+                   -isystem $(DAISYSP_DIR)/Synthesis \
+                   -isystem $(DAISYSP_DIR)/Utility
+INCLUDES += $(DAISYSP_INCLUDE)
+
 BUILD_DIR := build/test
 BIN       := $(BUILD_DIR)/run_all
 
@@ -33,8 +51,21 @@ SRC_SRCS := $(filter-out src/Config.cpp src/main.cpp \
                          src/controls/DaisyLed.cpp, \
                          $(SRC_ALL))
 
+# DaisySP sources compiled into the host test binary. Listed explicitly (not
+# globbed) — the goal is to pull in only the four voices we wrap plus their
+# transitive dependencies. Add new entries iteratively when link errors point
+# to missing symbols.
+DAISYSP_SRCS := $(DAISYSP_DIR)/Drums/analogbassdrum.cpp \
+                $(DAISYSP_DIR)/Drums/analogsnaredrum.cpp \
+                $(DAISYSP_DIR)/Drums/hihat.cpp \
+                $(DAISYSP_DIR)/PhysicalModeling/modalvoice.cpp \
+                $(DAISYSP_DIR)/PhysicalModeling/resonator.cpp \
+                $(DAISYSP_DIR)/Synthesis/oscillator.cpp \
+                $(DAISYSP_DIR)/Filters/svf.cpp
+
 SRCS := $(TEST_SRCS) $(SRC_SRCS)
-OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
+OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS)) \
+        $(patsubst %.cpp,$(BUILD_DIR)/daisysp/%.o,$(notdir $(DAISYSP_SRCS)))
 DEPS := $(OBJS:.o=.d)
 
 # ---- Targets -----------------------------------------------------------------
@@ -50,6 +81,23 @@ $(BIN): $(OBJS)
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+# DaisySP sources are compiled into a dedicated $(BUILD_DIR)/daisysp/ subdir so
+# the basename collision risk between e.g. src/randomization/IRng.cpp and any
+# similarly-named DaisySP file is structurally impossible.
+#
+# DaisySP has unused-parameter warnings, etc. that would fail under -Werror.
+# `-isystem` only suppresses warnings for *headers*, not for translation units
+# we're compiling ourselves — so we must drop -Werror on DaisySP.cpp's. We
+# strip -Werror and turn off the warnings DaisySP itself trips so this stays
+# noise-free even when DaisySP is updated.
+DAISYSP_CXXFLAGS := $(filter-out -Werror -Wall -Wextra,$(CXXFLAGS)) -w
+define DAISYSP_BUILD_RULE
+$(BUILD_DIR)/daisysp/$(notdir $(1:.cpp=.o)): $(1)
+	@mkdir -p $$(dir $$@)
+	$$(CXX) $$(DAISYSP_CXXFLAGS) $$(INCLUDES) -MMD -MP -c $$< -o $$@
+endef
+$(foreach src,$(DAISYSP_SRCS),$(eval $(call DAISYSP_BUILD_RULE,$(src))))
 
 run: $(BIN)
 	./$(BIN)

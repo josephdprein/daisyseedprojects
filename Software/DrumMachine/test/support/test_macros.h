@@ -179,3 +179,157 @@ struct AutoRegister {
                                               _dm_oss.str());                 \
         }                                                                     \
     } while (0)
+
+// ---- Audio / parameter assertion helpers (per spec §Test Harness) ----------
+// "Peak" everywhere in the test harness is max-abs-sample, never RMS. These
+// helpers operate on any container `buf` whose `size()` returns a count and
+// whose `operator[]` yields a `float`-compatible sample (typical concrete
+// types: std::vector<float>, std::array<float, N>).
+
+namespace drum_machine_test {
+
+// Inline so the helpers stay header-only. Returns the maximum |buf[i]|.
+template <typename Buf>
+inline double BufferPeak(const Buf& buf) {
+    double peak = 0.0;
+    const std::size_t n = buf.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(buf[i]);
+        const double a = v < 0.0 ? -v : v;
+        if (a > peak) peak = a;
+    }
+    return peak;
+}
+
+// Index of the first sample whose |buf[i]| exceeds `threshold`. Returns
+// buf.size() if no sample crosses — callers compare against an upper bound.
+template <typename Buf>
+inline std::size_t FirstTransientIndex(const Buf& buf, double threshold) {
+    const std::size_t n = buf.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(buf[i]);
+        const double a = v < 0.0 ? -v : v;
+        if (a > threshold) return i;
+    }
+    return n;
+}
+
+}  // namespace drum_machine_test
+
+// Audible: peak ≥ 0.05 (per spec §Mixer "test_instruments asserts each voice
+// in isolation has peak ≥ 0.05").
+#define EXPECT_AUDIO_NOT_SILENT(buf)                                          \
+    do {                                                                      \
+        const double _dm_peak = ::drum_machine_test::BufferPeak(buf);         \
+        if (!(_dm_peak >= 0.05)) {                                            \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_AUDIO_NOT_SILENT(" #buf ") failed: peak = "    \
+                    << _dm_peak << " < 0.05";                                 \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+    } while (0)
+
+// Bounded: peak ≤ max. Used per-voice (max=1.0) and at the mixer (max=0.95).
+#define EXPECT_AUDIO_PEAK_LE(buf, max)                                        \
+    do {                                                                      \
+        const double _dm_peak = ::drum_machine_test::BufferPeak(buf);         \
+        const double _dm_max  = static_cast<double>(max);                     \
+        if (!(_dm_peak <= _dm_max)) {                                         \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_AUDIO_PEAK_LE(" #buf ", " #max                 \
+                    << ") failed: peak = " << _dm_peak << " > " << _dm_max;   \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+    } while (0)
+
+// First detectable transient occurs at index ≤ sampleIdx. Threshold is fixed
+// at 0.01 (-40 dBFS) — well above DaisySP's idle DC noise floor but below the
+// 0.05 audibility line, so a voice that just barely passes EXPECT_AUDIO_NOT_
+// SILENT can still tell us *when* it first made a sample.
+#define EXPECT_FIRST_TRANSIENT_WITHIN(buf, sampleIdx)                         \
+    do {                                                                      \
+        constexpr double _dm_threshold = 0.01;                                \
+        const std::size_t _dm_first =                                         \
+            ::drum_machine_test::FirstTransientIndex((buf), _dm_threshold);   \
+        const std::size_t _dm_idx = static_cast<std::size_t>(sampleIdx);      \
+        if (!(_dm_first <= _dm_idx)) {                                        \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_FIRST_TRANSIENT_WITHIN(" #buf ", " #sampleIdx  \
+                    << ") failed: first transient at index " << _dm_first     \
+                    << " > " << _dm_idx                                       \
+                    << " (threshold=" << _dm_threshold << ")";                \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+    } while (0)
+
+// std::array<float, N> element-wise equality with a small tolerance. Used to
+// confirm Randomize() with depth=0 leaves a parameter snapshot untouched.
+#define EXPECT_PARAMS_UNCHANGED(a, b)                                         \
+    do {                                                                      \
+        const auto& _dm_pa = (a);                                             \
+        const auto& _dm_pb = (b);                                             \
+        if (_dm_pa.size() != _dm_pb.size()) {                                 \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_PARAMS_UNCHANGED(" #a ", " #b                  \
+                    << ") failed: size mismatch " << _dm_pa.size()            \
+                    << " vs " << _dm_pb.size();                               \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+        constexpr double _dm_eps = 1e-5;                                      \
+        for (std::size_t _dm_i = 0; _dm_i < _dm_pa.size(); ++_dm_i) {         \
+            const double _dm_d = static_cast<double>(_dm_pa[_dm_i])           \
+                               - static_cast<double>(_dm_pb[_dm_i]);          \
+            const double _dm_abs = _dm_d < 0 ? -_dm_d : _dm_d;                \
+            if (!(_dm_abs <= _dm_eps)) {                                      \
+                std::ostringstream _dm_oss;                                   \
+                _dm_oss << "EXPECT_PARAMS_UNCHANGED(" #a ", " #b              \
+                        << ") failed at [" << _dm_i << "]: "                  \
+                        << static_cast<double>(_dm_pa[_dm_i]) << " vs "       \
+                        << static_cast<double>(_dm_pb[_dm_i]);                \
+                ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,         \
+                                                  _dm_oss.str());             \
+            }                                                                 \
+        }                                                                     \
+    } while (0)
+
+// At least one element of `a` differs from the matching element of `b` by
+// more than `eps_relative * max(|a|+|b|, 1.0)`. Used to confirm Randomize()
+// with depth>0 actually moves parameters.
+#define EXPECT_PARAMS_DIFFER(a, b)                                            \
+    do {                                                                      \
+        const auto& _dm_pa = (a);                                             \
+        const auto& _dm_pb = (b);                                             \
+        if (_dm_pa.size() != _dm_pb.size()) {                                 \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_PARAMS_DIFFER(" #a ", " #b                     \
+                    << ") failed: size mismatch " << _dm_pa.size()            \
+                    << " vs " << _dm_pb.size();                               \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+        bool _dm_any = false;                                                 \
+        for (std::size_t _dm_i = 0; _dm_i < _dm_pa.size(); ++_dm_i) {         \
+            const double _dm_av =                                             \
+                static_cast<double>(_dm_pa[_dm_i]);                           \
+            const double _dm_bv =                                             \
+                static_cast<double>(_dm_pb[_dm_i]);                           \
+            const double _dm_d = _dm_av - _dm_bv;                             \
+            const double _dm_abs = _dm_d < 0 ? -_dm_d : _dm_d;                \
+            const double _dm_scale =                                          \
+                (_dm_av < 0 ? -_dm_av : _dm_av) +                             \
+                (_dm_bv < 0 ? -_dm_bv : _dm_bv);                              \
+            const double _dm_thr = 1e-4 * (_dm_scale > 1.0 ? _dm_scale : 1.0);\
+            if (_dm_abs > _dm_thr) { _dm_any = true; break; }                 \
+        }                                                                     \
+        if (!_dm_any) {                                                       \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_PARAMS_DIFFER(" #a ", " #b                     \
+                    << ") failed: arrays match within tolerance";             \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+    } while (0)
