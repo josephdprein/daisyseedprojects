@@ -10,7 +10,9 @@
 #   - run target: build then exec the binary.
 
 CXX      := g++
-CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror
+# DRUMMACHINE_HOST_TEST gates out libDaisy-dependent declarations (e.g. the
+# daisy::Pin pin map in src/Config.h) so the same headers compile on the host.
+CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -DDRUMMACHINE_HOST_TEST
 INCLUDES := -Isrc -Itest/support
 
 BUILD_DIR := build/test
