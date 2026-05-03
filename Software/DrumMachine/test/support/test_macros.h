@@ -265,6 +265,38 @@ inline std::size_t FirstTransientIndex(const Buf& buf, double threshold) {
         }                                                                     \
     } while (0)
 
+// EXPECT_LED_FIRED_WITHIN(rig, pad, ms): the MockLed history for `pad`
+// contains at least one sample > 0 in the last `ms` milliseconds. Used by the
+// simultaneous-press tests to assert two LEDs lit in the same control tick.
+//
+// "Within ms" is measured against the rig's current NowMs() — we scan the
+// trailing window [NowMs() - ms, NowMs()]. Threshold > 0 (not >= eps) because
+// MockLed clamps to exactly 0 when LedTrigger is idle, so any positive sample
+// proves Fire/PulseConfirm fired.
+#define EXPECT_LED_FIRED_WITHIN(rig, pad, ms)                                 \
+    do {                                                                      \
+        const auto&    _dm_hist = (rig).LedHistory(pad);                      \
+        const uint32_t _dm_now  = (rig).NowMs();                              \
+        const uint32_t _dm_win  = static_cast<uint32_t>(ms);                  \
+        const uint32_t _dm_lo   = _dm_now > _dm_win ? _dm_now - _dm_win : 0;  \
+        bool _dm_fired = false;                                               \
+        for (const auto& _dm_kv : _dm_hist) {                                 \
+            if (_dm_kv.first >= _dm_lo && _dm_kv.first <= _dm_now &&          \
+                _dm_kv.second > 0.0f) {                                       \
+                _dm_fired = true;                                             \
+                break;                                                        \
+            }                                                                 \
+        }                                                                     \
+        if (!_dm_fired) {                                                     \
+            std::ostringstream _dm_oss;                                       \
+            _dm_oss << "EXPECT_LED_FIRED_WITHIN(" #rig ", " #pad ", " #ms     \
+                    << ") failed: no positive brightness sample in ["         \
+                    << _dm_lo << ", " << _dm_now << "] ms";                   \
+            ::drum_machine_test::ThrowFailure(__FILE__, __LINE__,             \
+                                              _dm_oss.str());                 \
+        }                                                                     \
+    } while (0)
+
 // std::array<float, N> element-wise equality with a small tolerance. Used to
 // confirm Randomize() with depth=0 leaves a parameter snapshot untouched.
 #define EXPECT_PARAMS_UNCHANGED(a, b)                                         \
