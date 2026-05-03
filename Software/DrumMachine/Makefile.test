@@ -1,0 +1,58 @@
+# Makefile.test — host build of the DrumMachine test runner.
+#
+# Per task 01:
+#   - g++ -std=gnu++20 -O2 -g -Wall -Wextra -Werror
+#   - Output: build/test/run_all
+#   - Sources: test/main_test.cpp, test/test_*.cpp, test/support/*.cpp,
+#              src/**/*.cpp (excluding Config.cpp, main.cpp, and Daisy*).
+#   - Includes: src/, test/support/.
+#   - clean removes build/.
+#   - run target: build then exec the binary.
+
+CXX      := g++
+CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror
+INCLUDES := -Isrc -Itest/support
+
+BUILD_DIR := build/test
+BIN       := $(BUILD_DIR)/run_all
+
+# ---- Source discovery --------------------------------------------------------
+# Test sources: the runner entry point, all top-level test_*.cpp files, and any
+# support helpers under test/support/.
+TEST_SRCS := test/main_test.cpp \
+             $(wildcard test/test_*.cpp) \
+             $(wildcard test/support/*.cpp)
+
+# Production sources: every src/**/*.cpp except the firmware-only seam files.
+# We use shell `find` so newly added subdirectories are picked up automatically.
+SRC_ALL  := $(shell find src -type f -name '*.cpp' 2>/dev/null)
+SRC_SRCS := $(filter-out src/Config.cpp src/main.cpp \
+                         src/controls/DaisyButton.cpp \
+                         src/controls/DaisyLed.cpp, \
+                         $(SRC_ALL))
+
+SRCS := $(TEST_SRCS) $(SRC_SRCS)
+OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
+DEPS := $(OBJS:.o=.d)
+
+# ---- Targets -----------------------------------------------------------------
+.PHONY: all clean run
+.DEFAULT_GOAL := all
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(OBJS) -o $@
+
+$(BUILD_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+run: $(BIN)
+	./$(BIN)
+
+clean:
+	rm -rf build
+
+-include $(DEPS)
