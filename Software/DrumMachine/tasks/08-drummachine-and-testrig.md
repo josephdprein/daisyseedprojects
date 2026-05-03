@@ -82,18 +82,18 @@ Spec §Test Harness says "RandomizationEnabled and LedBrightness are read by
 the TestRig from the MockLed and from internal bookkeeping it maintains
 alongside the engine."
 
-**Recommended implementation:** TestRig mirrors the toggle state internally
-by watching its own press/release scripting — every time it scripts a
-press whose duration ends up ≥ `kHoldThresholdMs`, it flips a local bool.
-Initial state is `true`, matching the engine's default. This is fragile
-(it duplicates pad logic) but is what the spec asks for; the alternative
-— a `friend class TestRig` declaration on `DrumPad` — requires touching
-production code and is explicitly avoided by the spec's wording.
+**Implementer's call.** Two acceptable approaches:
 
-If during implementation the duplication is genuinely too brittle (e.g.
-edge cases where the boot-stuck mask suppresses a hold-toggle), surface
-this and propose adding a friend declaration. **Do not add the friend
-declaration without raising it first.**
+1. TestRig mirrors the toggle state by watching its own scripted holds
+   (every press whose duration crosses `kHoldThresholdMs` flips a local
+   bool). Initial state `true`. Pure observer; no production-code change.
+2. `friend class TestRig` on `DrumPad`, exposing the bool directly.
+
+Pick whichever is cleaner in the actual implementation context. **The
+hard rule: no spaghetti, no galaxy-brain abstractions.** If approach 1
+starts sprouting edge-case branches for the boot-stuck mask or
+multi-event interleaving, switch to approach 2 — that's the simpler code
+and does not require permission.
 
 `LedBrightness(pad)`: just `MockLed[pad].Last()` — no duplication needed.
 
@@ -109,10 +109,19 @@ declaration without raising it first.**
 4. **Subsequent identical presses with randomization disabled produce
    identical audio:** hold each pad >500 ms to disable randomization;
    `CaptureAudio` of two consecutive presses (with enough silence between
-   to fully decay) — assert the buffers are sample-equal (or near-equal
-   with `EXPECT_NEAR` tolerance for FP determinism if the DaisySP voices
-   contain any non-deterministic noise generators that aren't reset by
-   `Init`). If they aren't sample-equal, that is a real spec gap to surface.
+   to fully decay) — assert the buffers are sample-equal.
+
+   **HiHat determinism preflight:** before writing this case, research
+   whether DaisySP's `HiHat<>` (and any other noise-driven voice) can be
+   deterministically seeded — check the underlying noise/oscillator
+   classes for a seed setter, look for an internal RNG state we can
+   reset on `Trig`, or see if `Init(sampleRate)` already does this.
+   If determinism is achievable, plumb it through (extend the instrument
+   wrapper to seed the voice's noise source from `IRng`). If it
+   genuinely is not, **fall back** to a weaker assertion for the
+   noise-driven voices: parameter-equality via the
+   `Snapshot()` helper from task 06, with a comment in the test
+   explaining why audio-identity isn't asserted for that voice.
 
 Add `EXPECT_LED_FIRED_WITHIN` to `test_macros.h` if not already there from
 task 06: peeks at the most recent N ms of MockLed history and asserts at
@@ -129,13 +138,9 @@ least one sample > 0.
 
 ## Notes / risks
 
-- The "subsequent identical presses produce identical audio" test (item 4)
-  is the deepest behavioral check in the suite. If a DaisySP voice
-  internally uses an uncoupled noise generator that's not deterministic
-  per `Init`, two identical-parameter triggers could still produce
-  different audio. Investigate before weakening the assertion. This is
-  worth a `#TODO` or a flagged note back to the spec author if it's the
-  case for HiHat (which is noise-driven).
+- See item 4 above for the HiHat determinism preflight. Do that research
+  *before* writing the test — the answer determines whether the test asserts
+  audio-identity or parameter-identity for the noise-driven voices.
 - TestRig owning real instruments means task 06 must already be merged.
 - TestRig's `AdvanceMs` should advance in increments of one control tick
   (block size / sample rate) — not in 1 ms steps unless the block size

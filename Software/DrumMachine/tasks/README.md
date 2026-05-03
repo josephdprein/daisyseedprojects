@@ -30,8 +30,15 @@ Each task assumes the previous tasks are merged. Do not skip ahead.
   after every task from 01 onward.
 - Firmware build (`make`) is only required to succeed after task 09.
 
-## Open questions surfaced during planning
+## Resolved planning decisions
 
-Listed inline in the relevant tasks. The biggest one — how `TestRig` exposes
-`RandomizationEnabled` without a per-pad accessor on `DrumMachine` — is
-addressed in task 08.
+- **`Config.h` host-build gating** (task 02): `#if !defined(DRUMMACHINE_HOST_TEST)`
+  around the pin externs. Single header preserved.
+- **`TestRig::RandomizationEnabled`** (task 08): implementer's call between
+  observer-mirror and `friend class TestRig`. Hard rule: keep it simple.
+- **HiHat audio-identity test** (task 08): research seedability first; if
+  not seedable, fall back to parameter-identity for noise-driven voices.
+- **`daisy::Pwm` API** (task 09): preflight check; escalate if missing
+  rather than ship software PWM.
+- **Sequential implementation:** tasks are executed in order; no further
+  splitting of task 08.
