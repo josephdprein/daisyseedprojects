@@ -18,7 +18,7 @@ The implementer is **not** responsible for the physical hardware design, but the
 
 - **MCU**: Daisy Seed (STM32H750)
 - **Inputs**: 4× Adafruit arcade button (active-low, internal pull-up)
-- **Outputs**: 4× LED inside the same arcade buttons (PWM-capable GPIO; brightness 0..1)
+- **Outputs**: 4× LED inside the same arcade buttons. Driven by **hardware PWM** — each LED pin must be on a timer-capture/compare channel so brightness updates do not consume CPU. Software PWM is explicitly out of scope. The hardware integrator must select pins backed by four timer channels (any combination of TIM2/3/4/5/8/etc. CCR channels supported by `daisy::Pwm`).
 - **Audio**: stereo line-out only (no audio in)
 - **Time source**: `daisy::System::GetNow()` for `nowMs` (1 ms resolution)
 - **RNG seed source**: `daisy::System::GetUs()` sampled once at boot, before `DrumMachine::Init()`
@@ -27,7 +27,7 @@ The implementer is **not** responsible for the physical hardware design, but the
   // src/Config.h
   namespace Config {
       constexpr float    kSampleRate       = 48000.0f;   // Daisy default
-      constexpr size_t   kAudioBlockSize   = 48;          // 1 ms @ 48 kHz → control tick rate = 1 kHz
+      constexpr size_t   kAudioBlockSize   = 48;          // see "Audio Configuration"; implementer may tune
       constexpr uint32_t kHoldThresholdMs  = 500;
       constexpr uint32_t kLedAttackMs      = 5;
       constexpr uint32_t kLedDecayMs       = 120;
@@ -37,6 +37,7 @@ The implementer is **not** responsible for the physical hardware design, but the
       constexpr float    kDefaultRandomizationDepth = 0.5f;
 
       // Hardware pin map — TBD by hardware integrator. Kept here so app code never references pins directly.
+      // LED pins MUST be timer-PWM-capable (see Hardware Contract).
       extern const daisy::Pin kButtonPins[4];
       extern const daisy::Pin kLedPins[4];
   }
@@ -46,10 +47,10 @@ The implementer is **not** responsible for the physical hardware design, but the
 ## Audio Configuration
 
 - **Sample rate**: 48 kHz
-- **Block size**: 48 samples (= 1 ms = 1 kHz control tick rate)
+- **Block size**: implementer's choice in the range **1..96 samples** (≤ 2 ms control tick at 48 kHz). Default is 48 (1 ms / 1 kHz control tick). All time-based tests must tolerate any control-tick rate in this range.
 - **Channels in**: 0 (audio input is not used)
 - **Channels out**: 2 (mono signal duplicated to L+R)
-- **Allocation policy**: no heap allocation after `DrumMachine::Init()` returns; no allocation in `Tick()` or `Process()`.
+- **Allocation policy**: no heap allocation after `DrumMachine::Init()` returns; no allocation in `Tick()` or `Process()`. (Tests are also no-allocation in the audio path; setup/teardown may allocate freely.)
 
 ## Project Layout
 
@@ -67,7 +68,7 @@ Software/DrumMachine/
 │   ├── DrumPad.{h,cpp}         # ties one IButton + ILed + IInstrument together
 │   ├── Mixer.{h,cpp}           # per-voice gain, sum to mono
 │   ├── instruments/
-│   │   ├── IInstrument.h       # interface: Init, Trig, Process, Randomize, SetRandomizationDepth
+│   │   ├── IInstrument.h       # interface: Init(sampleRate, depth), Trig, Process, Randomize
 │   │   ├── BassDrum.{h,cpp}    # wraps daisysp::AnalogBassDrum
 │   │   ├── Snare.{h,cpp}       # wraps daisysp::AnalogSnareDrum
 │   │   ├── HiHat.{h,cpp}       # wraps daisysp::HiHat<>
@@ -76,7 +77,7 @@ Software/DrumMachine/
 │   │   ├── IButton.h           # interface
 │   │   ├── ILed.h              # interface
 │   │   ├── DaisyButton.{h,cpp} # IButton backed by daisy::Switch
-│   │   └── DaisyLed.{h,cpp}    # ILed backed by GPIO/PWM
+│   │   └── DaisyLed.{h,cpp}    # ILed backed by hardware-PWM timer channel
 │   ├── randomization/
 │   │   ├── IRng.h              # interface
 │   │   ├── XorShiftRng.{h,cpp} # default deterministic RNG
@@ -85,7 +86,7 @@ Software/DrumMachine/
 │       └── LedTrigger.{h,cpp}  # one-shot envelope + PulseConfirm pattern
 └── test/
     ├── support/
-    │   ├── test_macros.h       # TEST_CASE / EXPECT_* macros (assert-based)
+    │   ├── test_macros.h       # TEST_CASE / EXPECT_* macros (throw-based; see "Test Harness")
     │   ├── MockButton.{h,cpp}
     │   ├── MockLed.{h,cpp}
     │   ├── MockRng.{h,cpp}
@@ -120,11 +121,11 @@ enum class PadIndex : uint8_t {
 class IInstrument {
 public:
     virtual ~IInstrument() = default;
-    virtual void  Init(float sampleRate) = 0;
+    // depth01: 0 = always baseline; 1 = full random range. Init-time only — no runtime setter.
+    virtual void  Init(float sampleRate, float depth01) = 0;
     virtual void  Trig() = 0;                // fire the voice with current params
     virtual float Process() = 0;             // one mono sample
     virtual void  Randomize(IRng& rng) = 0;  // re-roll params per RandomizationProfile
-    virtual void  SetRandomizationDepth(float depth01) = 0;  // init-time only; 0 = freeze, 1 = full range
 };
 
 // src/controls/IButton.h
@@ -174,10 +175,16 @@ public:
         std::array<IInstrument*, static_cast<size_t>(PadIndex::Count)> instruments,
         IRng& rng);
 
-    void  Init(float sampleRate);     // forwards to instruments + LedTriggers
-    void  Tick(uint32_t nowMs);       // call once per audio block (~1 kHz)
-    float Process();                  // call once per audio sample; returns mono
-    DrumPad& Pad(PadIndex i);
+    // Init is idempotent: every call performs a full state reset.
+    //   - forwards (sampleRate, Config::kDefaultRandomizationDepth) to each IInstrument::Init
+    //   - clears all LedTrigger envelope state (LEDs go dark)
+    //   - re-arms hold detection on every pad
+    //   - re-applies the boot-stuck-button mask (see DrumPad Behavior below)
+    // Calling Init() a second time is supported and may be used as a "panic reset".
+    void  Init(float sampleRate);
+
+    void  Tick(uint32_t nowMs);   // call once per audio block (≤ 2 ms)
+    float Process();              // call once per audio sample; returns mono
 };
 ```
 
@@ -194,6 +201,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 }
 ```
 
+There is no public accessor for individual pads; tests interact with the engine via `TestRig` (see Test Harness), which queries the same `MockLed` / `MockRng` references it injected.
+
 ## DrumPad Behavior (the heart of the spec)
 
 `DrumPad` owns one `IButton`, one `ILed`, one `IInstrument`, one `IRng` reference, and one `LedTrigger` envelope.
@@ -201,6 +210,17 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 ```
 DrumPad::Tick(nowMs):
   button.Update(nowMs)
+
+  // Boot-stuck-button mask: if a button reads "down" on the very first Tick after Init(),
+  // suppress its press semantics until it has been observed released at least once.
+  // Without this, holding a button at power-on would fire all four drums + a randomization.
+  // Implementations must include a brief comment at the masking site explaining this.
+  if firstTickAfterInit and button.IsDown():
+      pressMaskedUntilRelease = true
+  if pressMaskedUntilRelease:
+      if button.JustReleased():
+          pressMaskedUntilRelease = false
+      return  // no Trig, no PulseConfirm, no hold detection while masked
 
   if button.JustPressed():
       instrument.Trig()              // requirement: trigger immediately
@@ -224,6 +244,10 @@ DrumPad::Tick(nowMs):
 
 **First-press semantics (important for testers):** the very first `Trig()` after `Init()` uses the baseline parameter values. Each `Randomize()` then populates the parameters used by the *next* `Trig()`. Disabling randomization freezes whatever values were last loaded — including any random values from a previous press.
 
+**LED envelope shape:** `LedTrigger::Fire(nowMs)` produces a **linear ramp** from `1.0` at `nowMs + Config::kLedAttackMs` down to `0.0` at `nowMs + Config::kLedAttackMs + Config::kLedDecayMs`. Before the attack ends the value rises linearly from 0 to 1. After decay completes the value is exactly 0. Tests assert this shape.
+
+**PulseConfirm vs active envelope:** if `PulseConfirm(nowMs)` is called while a `Fire` envelope is still active, **PulseConfirm wins** — the trigger envelope is canceled and the pulse pattern (`on / gap / on / off`) drives the LED until it completes. This rule is observable: tests can `Fire`, advance 30 ms, then `PulseConfirm`, and assert the next 200 ms matches the pulse pattern, not a sum.
+
 LED behavior: dark when not triggered (matches the "LED lights any time the corresponding drum is triggered" requirement). Toggle state is conveyed only by the `PulseConfirm` blink at the moment of toggle — there is no steady-state indicator.
 
 ## Instruments & Randomization
@@ -236,24 +260,33 @@ struct ParamRange { float min; float max; float baseline; };
 struct RandomizationProfile {
     // One ParamRange per setter the voice exposes (e.g. freq, decay, tone).
     // depth: 0 → always baseline; 1 → uniform sample in [min, max].
-    // Stored on the instrument (not the profile) and set once at Init().
+    // Stored on the instrument and set once at Init(sampleRate, depth).
 };
 ```
 
 `Randomize(rng)` for each parameter computes:
-`value = lerp(baseline, rng.NextFloat() * (max - min) + min, depth)`
+```
+raw   = lerp(baseline, rng.NextFloat() * (max - min) + min, depth)
+value = clamp(raw, min, max)   // tolerates baseline outside [min, max] without UB
+```
 then calls the corresponding DaisySP setter.
 
-`SetRandomizationDepth` is **init-time only**. There is no runtime control surface for depth (the press-and-hold toggle is a binary on/off). Default depth: `Config::kDefaultRandomizationDepth = 0.5`.
+Depth is **init-time only** — passed as the second argument to `IInstrument::Init`. There is no runtime depth control surface (the press-and-hold toggle is a binary on/off). Default depth: `Config::kDefaultRandomizationDepth = 0.5`.
 
-Voice-by-voice mapping (DaisySP APIs confirmed in `Software/GuitarPedal/dependencies/DaisySP/`; voice setup pattern mirrors `drum_module.cpp:119-129` and `:239-293`):
+### Voice-by-voice mapping
 
-| Pad       | DaisySP class       | Randomized params                                       | Default baseline (musical) |
-|-----------|---------------------|---------------------------------------------------------|----------------------------|
-| Bass      | `AnalogBassDrum`    | freq, decay, tone (`SetSelfFmAmount`), accent           | 50 Hz, 0.6 s, 0.3, 0.6     |
-| Snare     | `AnalogSnareDrum`   | freq, decay, snappy, tone, accent                       | 200 Hz, 0.3 s, 0.6, 0.5, 0.7 |
-| Hi-hat    | `HiHat<>`           | freq, decay, noisiness, tone, accent                    | 6 kHz, 0.15 s, 0.7, 0.5, 0.7 |
-| Resonator | `ModalVoice`        | freq, structure, brightness, damping, accent            | 220 Hz, 0.4, 0.6, 0.5, 0.7 |
+DaisySP APIs confirmed in `Software/GuitarPedal/dependencies/DaisySP/`; voice setup pattern mirrors `drum_module.cpp:119-129` and `:239-293`. **Decay values are normalized 0..1** as DaisySP's `SetDecay` expects (not seconds). **Accent is fixed at the baseline value** for every voice — it is not in the randomized parameter list, since pad-style players expect consistent loudness.
+
+| Pad       | DaisySP class       | Randomized params                              | Fixed     | Default baseline (musical)               |
+|-----------|---------------------|------------------------------------------------|-----------|------------------------------------------|
+| Bass      | `AnalogBassDrum`    | freq, decay, tone (`SetSelfFmAmount`)          | accent    | freq=50 Hz, decay=0.6, tone=0.3, accent=0.7 |
+| Snare     | `AnalogSnareDrum`   | freq, decay, snappy, tone                      | accent    | freq=200 Hz, decay=0.4, snappy=0.6, tone=0.5, accent=0.7 |
+| Hi-hat    | `HiHat<>`           | freq, decay, noisiness, tone                   | accent    | freq=6 kHz, decay=0.2, noisiness=0.7, tone=0.5, accent=0.7 |
+| Resonator | `ModalVoice`        | freq, structure, brightness, damping           | accent    | freq=220 Hz, structure=0.4, brightness=0.6, damping=0.5, accent=0.7 |
+
+### Range tuning policy
+
+`ParamRange::min` / `max` for each randomized parameter are chosen by the **implementer** as a best-effort musical first pass — there is no spec-mandated table. The acceptance gate for ranges is the manual hardware audition: with depth = 0.5 each pad must produce sounds that vary audibly press-to-press while staying recognizably in-genre (a kick that always sounds like a kick, a snare that always sounds like a snare). Tuning will be revisited after user testing on the assembled hardware. Tests therefore assert *that* parameters change and stay within `[min, max]`, not that they hit specific values.
 
 Resonator-frequency quantization to a scale is out of scope (see Out of Scope).
 
@@ -261,9 +294,15 @@ Resonator-frequency quantization to a scale is out of scope (see Out of Scope).
 
 `Mixer::Process()` sums the four `instrument.Process()` outputs with per-voice gains. The existing `drum_module.cpp:364-376` uses bass × 6.0, snare × 0.9, hi-hat × 1.0 — these are a *starting reference*, not specification.
 
+**"Peak" definition (used throughout the test harness):**
+```
+peak(buffer) = max over s in buffer of |buffer[s]|
+```
+i.e. maximum absolute sample value. RMS is not used.
+
 **Specification (test-driven, not value-driven):**
 - Implementer chooses initial gains.
-- `test_mixer.cpp` asserts that with all four pads triggered simultaneously at maximum accent, the resulting audio buffer has `peak ≤ 0.95` (no hard clipping).
+- `test_mixer.cpp` asserts that with all four pads triggered simultaneously at full accent, the captured audio buffer has `peak ≤ 0.95` (no hard clipping).
 - `test_instruments.cpp` asserts each voice in isolation has `peak ≥ 0.05` after a `Trig()` (audible).
 - Gains are tuned to satisfy both.
 
@@ -273,9 +312,9 @@ Output is mono, written to both stereo channels in `main.cpp`'s `AudioCallback`.
 
 Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that the actual code behaves correctly — including audio.
 
-- **Build target**: `g++ -std=gnu++20 -Wall -Wextra -Werror`, links against the same DaisySP source as firmware (DaisySP is portable C++ with no Daisy-hardware dependencies). Excludes `libDaisy` and the `DaisyButton` / `DaisyLed` / `Config.cpp` / `main.cpp` files (the hardware seam).
-- **Test framework**: header-only, hand-rolled (`assert`-based macros in `test/support/test_macros.h`) — no extra submodules.
-- **Build artifact**: a single binary `build/test/run_all` (linked from `main_test.cpp` + all `test_*.cpp` + the `support/` files + the host-portable subset of `src/`). Each `TEST_CASE(name)` self-registers; `run_all` iterates them and prints `passed/failed/total`. Exit code is 0 iff all pass.
+- **Build target**: `g++ -std=gnu++20 -Wall -Wextra -Werror`. The host build compiles the required DaisySP `.cpp` files **directly from source** as part of `Makefile.test` (DaisySP is portable C++ with no Daisy-hardware dependencies). It does **not** link against the prebuilt arm-none-eabi static library — that lib is firmware-only. Excludes `libDaisy` and the `DaisyButton` / `DaisyLed` / `Config.cpp` / `main.cpp` files (the hardware seam).
+- **Test framework**: header-only, hand-rolled in `test/support/test_macros.h`. `EXPECT_*` macros throw a `TestFailure` exception on assertion failure (carrying file/line/message). `TEST_CASE(name)` self-registers into a static registry. `run_all` iterates the registry, wraps each case in `try { … } catch (const TestFailure& e) { record failure } catch (const std::exception& e) { record uncaught } catch (...) { record uncaught }`, and prints `passed/failed/total` accurately even when individual cases throw. Exit code is 0 iff `failed == 0`.
+- **Build artifact**: a single binary `build/test/run_all`.
 - **TestRig API**:
   ```cpp
   class TestRig {
@@ -286,7 +325,7 @@ Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that 
       void PressButton(PadIndex pad);              // press at current sim time
       void HoldButton(PadIndex pad, uint32_t ms);  // press, advance ms, release
       void ReleaseButton(PadIndex pad);
-      void AdvanceMs(uint32_t ms);                 // advances sim clock; calls Tick() each ms; runs no audio
+      void AdvanceMs(uint32_t ms);                 // advances sim clock; calls Tick() each block; runs no audio
       std::vector<float> CaptureAudio(uint32_t ms); // advances sim clock AND fills buffer at kSampleRate
 
       float LedBrightness(PadIndex pad) const;
@@ -294,6 +333,7 @@ Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that 
       uint32_t NowMs() const;
   };
   ```
+  `TestRig` is the only test seam into per-pad state — `DrumMachine` itself exposes no public per-pad accessor. `RandomizationEnabled` and `LedBrightness` are read by the `TestRig` from the `MockLed` and from internal bookkeeping it maintains alongside the engine.
 - **Mock APIs**:
   ```cpp
   class MockButton : public IButton {
@@ -315,17 +355,17 @@ Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that 
   ```
 - **Assertion helpers**:
   - `EXPECT_AUDIO_NOT_SILENT(buf)` — peak ≥ 0.05
-  - `EXPECT_AUDIO_PEAK_LE(buf, max)`
+  - `EXPECT_AUDIO_PEAK_LE(buf, max)` — peak ≤ max (peak = max abs sample)
   - `EXPECT_FIRST_TRANSIENT_WITHIN(buf, sampleIdx)`
   - `EXPECT_LED_FIRED_WITHIN(rig, pad, ms)`
   - `EXPECT_PARAMS_UNCHANGED(instrument)` / `EXPECT_PARAMS_DIFFER(a, b)`
 - **Required test cases** (one per file unless noted):
-  - `test_drum_pad`: press → `Trig()` fires same tick; `Randomize()` called after `Trig()`.
+  - `test_drum_pad`: press → `Trig()` fires same tick; `Randomize()` called after `Trig()`; boot-stuck button is masked until released.
   - `test_hold_toggles`: 500 ms hold flips `RandomizationEnabled`; subsequent presses produce identical audio buffers; another 500 ms hold flips it back.
-  - `test_led_envelope`: LED brightness > 0 within 5 ms of trigger; ≤ 0.05 by 130 ms; `PulseConfirm` shape matches `Config::kPulseConfirm*`.
-  - `test_instruments`: each voice produces non-silent, bounded output; depth = 0 freezes params across `Randomize()` calls; depth = 1 spans the configured range across N samples.
-  - `test_randomization`: with `MockRng::SetSequence({...})`, instrument parameters are exactly the expected lerp results.
-  - `test_mixer`: all four pads firing at max accent → peak ≤ 0.95.
+  - `test_led_envelope`: brightness rises linearly 0→1 over `kLedAttackMs`, falls linearly 1→0 over `kLedDecayMs`, is 0 thereafter; `PulseConfirm` shape matches `Config::kPulseConfirm*`; PulseConfirm fired during an active envelope cancels it.
+  - `test_instruments`: each voice produces non-silent, bounded output; constructing with depth = 0 freezes params across `Randomize()` calls; depth = 1 spans the configured `[min, max]` range across N samples.
+  - `test_randomization`: with `MockRng::SetSequence({...})`, instrument parameters are exactly the expected `clamp(lerp(...))` results.
+  - `test_mixer`: all four pads firing at full accent → peak ≤ 0.95.
   - `test_simultaneous_press`: two and four pads pressed in the same control tick all trigger; resulting buffer is non-silent and bounded.
 - **Decoupling smoke test** (inside `test_drum_pad`): construct a `DrumPad` with a stub `IInstrument` that records `Trig`/`Randomize` calls; verify the pad drives it correctly without depending on any concrete instrument.
 
@@ -334,7 +374,7 @@ Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that 
 All new — no existing files are modified:
 - `Software/DrumMachine/Makefile`
 - `Software/DrumMachine/Makefile.test`
-- `Software/DrumMachine/README.md`
+- `Software/DrumMachine/README.md` (see "README Contents" below)
 - `Software/DrumMachine/src/main.cpp`
 - `Software/DrumMachine/src/Config.{h,cpp}`
 - `Software/DrumMachine/src/PadIndex.h`
@@ -350,6 +390,16 @@ All new — no existing files are modified:
 - `Software/DrumMachine/test/main_test.cpp`
 - `Software/DrumMachine/test/test_*.cpp` (seven files listed in layout)
 
+### README Contents
+
+`README.md` must contain exactly these four sections (and may not require any others):
+1. **Build firmware** — the `make` invocation, prerequisites, and where the resulting `.bin` lands.
+2. **Flash firmware** — how to put the Daisy Seed in DFU mode and run `make program-dfu` (or the equivalent), plus the troubleshooting one-liner if `dfu-util` doesn't see the device.
+3. **Run host tests** — `make -f Makefile.test && ./build/test/run_all`, expected output shape, and the exit-code contract.
+4. **Editing the pin map** — pointer to `src/Config.cpp`, the constraint that LED pins must be timer-PWM-capable, and a note that no other file should reference pins directly.
+
+Total length target: ~30 lines. No marketing copy, no architecture overview (that lives here in `SPECIFICATION.md`).
+
 ## Reuse from the Existing Codebase
 
 - **Submodules**: `Software/GuitarPedal/dependencies/libDaisy` and `dependencies/DaisySP` — referenced directly from `Software/DrumMachine/Makefile` via relative path; no duplication.
@@ -359,21 +409,22 @@ All new — no existing files are modified:
 
 ## Build Configuration
 
-- **Firmware build**: `arm-none-eabi-g++ -std=gnu++20 -Ofast -Wall -Wextra -Werror`. Boot mode `BOOT_SRAM` (matches existing pedal firmware).
-- **Host test build**: `g++ -std=gnu++20 -O2 -g -Wall -Wextra -Werror`.
-- **Submodule prerequisite**: `libDaisy` and `DaisySP` static libraries must be built before `make`. Reuse the existing helper: `bash Software/GuitarPedal/ci/build_libs.sh` (skips CloudSeed/RTNeural — those aren't needed here). Document this in `README.md`.
+- **Firmware build**: `arm-none-eabi-g++ -std=gnu++20 -Ofast -Wall -Wextra -Werror`. Boot mode `BOOT_SRAM` (matches existing pedal firmware). Links against the prebuilt `libdaisysp.a` and `libdaisy.a` static libraries.
+- **Host test build**: `g++ -std=gnu++20 -O2 -g -Wall -Wextra -Werror`. Compiles the required DaisySP `.cpp` files directly from `Software/GuitarPedal/dependencies/DaisySP/Source/` (specifically the four voice classes plus their helpers — the implementer adds files to `Makefile.test`'s source list as needed). DaisySP headers should be included via `-isystem` so DaisySP's own warnings aren't promoted by `-Werror`.
+- **Submodule prerequisite (firmware only)**: `libDaisy` and `DaisySP` static libraries must be built before `make`. Reuse the existing helper: `bash Software/GuitarPedal/ci/build_libs.sh` (skips CloudSeed/RTNeural — those aren't needed here). The host test build does **not** require this step. Document this in `README.md`.
 
 ## Verification
 
 End-to-end checks the implementer (or an AI agent) runs after building:
 
-1. **Host tests**: `cd Software/DrumMachine && make -f Makefile.test && ./build/test/run_all` → exit code 0; output reports all test cases passed.
+1. **Host tests**: `cd Software/DrumMachine && make -f Makefile.test && ./build/test/run_all` → exit code 0; output reports all test cases passed (`passed/failed/total` line with `failed == 0`).
 2. **Firmware build**: `cd Software/DrumMachine && make` → produces a `.bin` for the Daisy Seed with no warnings (`-Werror` enforces this).
 3. **Manual hardware smoke test** (out of scope for AI agents, listed for completeness):
    - Press each button → corresponding LED flashes and drum sound plays.
-   - Press the same button rapidly → sound varies on each press (randomization is working).
+   - Press the same button rapidly → sound varies on each press (randomization is working) and stays in-genre.
    - Hold any button >500 ms → LED double-blinks confirm pattern; subsequent presses produce identical sounds (randomization disabled). Hold again → variation returns.
    - Press all four buttons simultaneously → all four sounds play, no audible clipping.
+   - Power on with a finger held on any button → that drum does **not** fire on boot; releasing and pressing it triggers normally.
 
 ## Out of Scope (Dream List, not implemented now)
 
@@ -382,5 +433,6 @@ End-to-end checks the implementer (or an AI agent) runs after building:
 - Pitch quantization for the resonator
 - MIDI in/out
 - Runtime control of randomization depth (currently init-time only)
+- Per-voice accent randomization (intentionally fixed)
 
 The interfaces above (`IInstrument`, `IButton`, `ILed`, `IRng`) are the seams these features would plug into later.
