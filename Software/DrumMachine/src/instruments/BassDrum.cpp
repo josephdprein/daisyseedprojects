@@ -39,6 +39,11 @@ void BassDrum::Init(float sampleRate, float depth01) {
     current_[1] = profile_.params[1].baseline;
     current_[2] = profile_.params[2].baseline;
 
+    // Seed the two-deep history with baselines so RestorePreviousTrig() called
+    // before any Trig() is well-defined (locks the baseline sound).
+    prev_      = current_;
+    prev_prev_ = current_;
+
     voice_.SetFreq(current_[0]);
     voice_.SetDecay(current_[1]);
     voice_.SetSelfFmAmount(current_[2]);
@@ -47,6 +52,11 @@ void BassDrum::Init(float sampleRate, float depth01) {
 }
 
 void BassDrum::Trig() {
+    // Shift the history before firing: prev_prev_ holds the params from the
+    // Trig BEFORE the most recent one — which is what RestorePreviousTrig()
+    // restores when the user holds-to-disable randomization.
+    prev_prev_ = prev_;
+    prev_      = current_;
     voice_.Trig();
 }
 
@@ -63,6 +73,15 @@ void BassDrum::Randomize(IRng& rng) {
     voice_.SetDecay(current_[1]);
     voice_.SetSelfFmAmount(current_[2]);
     // Accent intentionally not re-rolled (see spec).
+}
+
+void BassDrum::RestorePreviousTrig() {
+    // Roll current_ back to the params used by the press BEFORE the most
+    // recent one. Accent is fixed and therefore unaffected.
+    current_ = prev_prev_;
+    voice_.SetFreq(current_[0]);
+    voice_.SetDecay(current_[1]);
+    voice_.SetSelfFmAmount(current_[2]);
 }
 
 }  // namespace drum_machine

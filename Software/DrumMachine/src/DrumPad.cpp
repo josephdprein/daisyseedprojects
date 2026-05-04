@@ -70,6 +70,19 @@ void DrumPad::Tick(uint32_t nowMs) {
     if (button_.IsDown() && holdToggleArmed_ &&
         button_.HeldMs() >= Config::kHoldThresholdMs) {
         randomizationEnabled_ = !randomizationEnabled_;
+        if (!randomizationEnabled_) {
+            // Transitioning enabled → disabled: roll the instrument back to
+            // the params used by the press BEFORE this one — i.e. the sound
+            // the user heard one press ago, which is what they're trying to
+            // lock in. The hold-press itself ran a Randomize() that wrote
+            // fresh values into current_; without this restore, the locked
+            // sound would be the spurious post-Randomize values rather than
+            // the sound the user actually liked.
+            instrument_.RestorePreviousTrig();
+        }
+        // Re-enabling does not auto-randomize — the next press still plays
+        // the locked sound, and randomization variation begins on the press
+        // after that.
         // PulseConfirm wins over the active Fire envelope (see LedTrigger
         // and spec §PulseConfirm vs active envelope).
         ledTrigger_.PulseConfirm(nowMs);

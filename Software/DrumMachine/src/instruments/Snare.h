@@ -29,6 +29,7 @@ public:
     void  Trig() override;
     float Process() override;
     void  Randomize(IRng& rng) override;
+    void  RestorePreviousTrig() override;
 
 #if defined(DRUMMACHINE_HOST_TEST)
     const std::array<float, kNumRandomized>& Snapshot() const { return current_; }
@@ -40,6 +41,9 @@ private:
     daisysp::AnalogSnareDrum               voice_;
     RandomizationProfile<kNumRandomized>   profile_;
     std::array<float, kNumRandomized>      current_{};
+    // Two-deep Trig() history; see BassDrum.h for the contract.
+    std::array<float, kNumRandomized>      prev_{};
+    std::array<float, kNumRandomized>      prev_prev_{};
     float                                  depth_   = 0.0f;
     float                                  accent_  = 0.7f;
 };

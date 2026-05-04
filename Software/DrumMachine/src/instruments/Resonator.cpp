@@ -32,6 +32,8 @@ void Resonator::Init(float sampleRate, float depth01) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = profile_.params[i].baseline;
     }
+    prev_      = current_;
+    prev_prev_ = current_;
 
     voice_.SetFreq(current_[0]);
     voice_.SetStructure(current_[1]);
@@ -42,6 +44,8 @@ void Resonator::Init(float sampleRate, float depth01) {
 }
 
 void Resonator::Trig() {
+    prev_prev_ = prev_;
+    prev_      = current_;
     voice_.Trig();
 }
 
@@ -53,6 +57,14 @@ void Resonator::Randomize(IRng& rng) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = ApplyDepth(profile_.params[i], rng.NextFloat(), depth_);
     }
+    voice_.SetFreq(current_[0]);
+    voice_.SetStructure(current_[1]);
+    voice_.SetBrightness(current_[2]);
+    voice_.SetDamping(current_[3]);
+}
+
+void Resonator::RestorePreviousTrig() {
+    current_ = prev_prev_;
     voice_.SetFreq(current_[0]);
     voice_.SetStructure(current_[1]);
     voice_.SetBrightness(current_[2]);

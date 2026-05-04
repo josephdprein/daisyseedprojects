@@ -37,4 +37,23 @@ public:
     // value = clamp(lerp(baseline, min + rng()*(max-min), depth), min, max).
     // Must be no-op-equivalent when depth is 0.
     virtual void Randomize(IRng& rng) = 0;
+
+    // Restore the parameter set used by the Trig() call BEFORE the most recent
+    // one. Used by DrumPad when randomization is toggled OFF: the user's
+    // intent is to lock the sound they heard one press ago — not the sound
+    // produced by the press that initiated the hold (which itself ran a fresh
+    // Randomize).
+    //
+    // Implementation contract: each Trig() shifts a two-deep history of the
+    // parameters that were active at fire time. RestorePreviousTrig() copies
+    // the older slot back into `current_` and applies it via the DaisySP
+    // setters. Subsequent Trig()s reproduce that earlier sound.
+    //
+    // Edge cases:
+    //   - Called before any Trig() has fired: restores the baseline (the
+    //     history slots are seeded with baseline at Init()).
+    //   - Called after exactly one Trig(): same — both history slots still
+    //     hold the pre-first-trig baseline, so locking on the first press
+    //     freezes the baseline.
+    virtual void RestorePreviousTrig() = 0;
 };

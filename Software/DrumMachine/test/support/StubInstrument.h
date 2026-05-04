@@ -25,6 +25,7 @@ public:
     enum class Event {
         Trig,
         Randomize,
+        RestorePreviousTrig,
     };
 
     StubInstrument() = default;
@@ -49,9 +50,15 @@ public:
         events_.push_back(Event::Randomize);
     }
 
+    void RestorePreviousTrig() override {
+        ++restoreCount_;
+        events_.push_back(Event::RestorePreviousTrig);
+    }
+
     // Inspectors ----------------------------------------------------------
     std::size_t TrigCount()      const { return trigCount_; }
     std::size_t RandomizeCount() const { return randomizeCount_; }
+    std::size_t RestoreCount()   const { return restoreCount_; }
     IRng*       LastRng()        const { return lastRng_; }
 
     const std::vector<Event>& Events() const { return events_; }
@@ -61,12 +68,14 @@ public:
     void Reset() {
         trigCount_      = 0;
         randomizeCount_ = 0;
+        restoreCount_   = 0;
         events_.clear();
     }
 
 private:
     std::size_t        trigCount_      = 0;
     std::size_t        randomizeCount_ = 0;
+    std::size_t        restoreCount_   = 0;
     IRng*              lastRng_        = nullptr;
     std::vector<Event> events_;
 };

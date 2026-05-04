@@ -6,7 +6,7 @@ Build a new standalone firmware project for a four-button drum machine on the Da
 
 Behavior per button:
 - **Press**: trigger the voice immediately, light the LED, then re-randomize that voice's parameters for the next trigger.
-- **Press-and-hold** (≥500 ms): toggle randomization on/off for that pad. The press itself still triggers the sound.
+- **Press-and-hold** (≥500 ms): toggle randomization on/off for that pad. The press itself still triggers the sound. When the toggle goes from *enabled* to *disabled*, the locked sound is the one the user heard on the press **before** the hold-press — not the sound played by the hold-press itself (which used freshly randomized params). Re-enabling does not auto-randomize; the press after re-enable still plays the locked sound.
 
 The architecture must be cleanly decoupled so instruments, button behavior, and (eventually) modes can be swapped. A native-host test harness lets AI agents verify behavior without flashing hardware.
 
@@ -126,6 +126,10 @@ public:
     virtual void  Trig() = 0;                // fire the voice with current params
     virtual float Process() = 0;             // one mono sample
     virtual void  Randomize(IRng& rng) = 0;  // re-roll params per RandomizationProfile
+    // Roll current params back to those used by the Trig() call BEFORE the
+    // most recent one. Implementations keep a two-deep history that shifts
+    // at the top of every Trig(); see §Instruments & Randomization.
+    virtual void  RestorePreviousTrig() = 0;
 };
 
 // src/controls/IButton.h
@@ -231,6 +235,14 @@ DrumPad::Tick(nowMs):
 
   if button.IsDown() and holdToggleArmed and button.HeldMs() >= Config::kHoldThresholdMs:
       randomizationEnabled = !randomizationEnabled
+      if not randomizationEnabled:
+          // Enabled → disabled: lock the params from the press BEFORE this one
+          // (the sound the user heard one press ago). The hold-press itself
+          // already ran a Randomize that overwrote current_; without this
+          // restore we'd lock the spurious post-Randomize values.
+          instrument.RestorePreviousTrig()
+      // Disabled → enabled: no auto-randomize. The next press still plays the
+      // locked sound; variation begins on the press after that.
       ledTrigger.PulseConfirm(nowMs) // see Config::kPulseConfirm* shape
       holdToggleArmed = false        // don't re-toggle until next press
 
@@ -242,7 +254,13 @@ DrumPad::Tick(nowMs):
 
 `DrumMachine::Tick()` calls each pad's `Tick()` in turn; multiple pads pressed in the same control tick all trigger in that tick, and `Process()` sums their outputs.
 
-**First-press semantics (important for testers):** the very first `Trig()` after `Init()` uses the baseline parameter values. Each `Randomize()` then populates the parameters used by the *next* `Trig()`. Disabling randomization freezes whatever values were last loaded — including any random values from a previous press.
+**First-press semantics (important for testers):** the very first `Trig()` after `Init()` uses the baseline parameter values. Each `Randomize()` then populates the parameters used by the *next* `Trig()`.
+
+**Locking semantics (press-and-hold to disable randomization):** the locked params are the ones used by the press *before* the hold-press, not the params used by the hold-press itself. Sequence:
+- Click → user hears Sound A (params P_A) → Randomize → next-press params = P_B.
+- Click+hold → user hears Sound B (params P_B) → Randomize → next-press params = P_C → 500 ms hold-toggle fires → randomization disabled and `RestorePreviousTrig()` rolls `current_` back to P_A.
+- Subsequent presses with randomization disabled play P_A.
+Holding the very first press (no prior trig history) locks the baseline. Re-enabling randomization via a second hold does **not** auto-randomize; the press immediately after re-enable still plays the locked sound, and variation resumes on the press after that.
 
 **LED envelope shape:** `LedTrigger::Fire(nowMs)` produces a **linear ramp** from `1.0` at `nowMs + Config::kLedAttackMs` down to `0.0` at `nowMs + Config::kLedAttackMs + Config::kLedDecayMs`. Before the attack ends the value rises linearly from 0 to 1. After decay completes the value is exactly 0. Tests assert this shape.
 
@@ -272,6 +290,14 @@ value = clamp(raw, min, max)   // tolerates baseline outside [min, max] without 
 then calls the corresponding DaisySP setter.
 
 Depth is **init-time only** — passed as the second argument to `IInstrument::Init`. There is no runtime depth control surface (the press-and-hold toggle is a binary on/off). Default depth: `Config::kDefaultRandomizationDepth = 0.5`.
+
+**Two-deep parameter history (per instrument):** to support `RestorePreviousTrig`, every `IInstrument` keeps two snapshots of `current_` alongside the live values: `prev_` (the params used by the most recent `Trig()`) and `prev_prev_` (the params used by the `Trig()` before that). The shift happens at the top of every `Trig()`:
+```
+prev_prev_ = prev_
+prev_      = current_
+voice.Trig()
+```
+`Init()` seeds both slots with the baseline so calling `RestorePreviousTrig()` before any `Trig()` is well-defined (locks the baseline). `RestorePreviousTrig()` copies `prev_prev_` back into `current_` and re-applies it via the DaisySP setters.
 
 ### Voice-by-voice mapping
 
@@ -367,6 +393,7 @@ Goal: AI agents can run `make -f Makefile.test` and get a green/red signal that 
   - `test_randomization`: with `MockRng::SetSequence({...})`, instrument parameters are exactly the expected `clamp(lerp(...))` results.
   - `test_mixer`: all four pads firing at full accent → peak ≤ 0.95.
   - `test_simultaneous_press`: two and four pads pressed in the same control tick all trigger; resulting buffer is non-silent and bounded.
+  - `test_restore_previous`: instrument-level (`RestorePreviousTrig` at 0/1/2 prior trigs restores baseline / baseline / press-1 params, and locked presses preserve `current_`); DrumPad-level (disable hold-toggle calls `RestorePreviousTrig` exactly once with order `Trig → Randomize → RestorePreviousTrig`; enable hold-toggle does not call it); end-to-end (the user's press-release-then-press-hold scenario produces a locked-press buffer identical to the first-press buffer at the same seed).
 - **Decoupling smoke test** (inside `test_drum_pad`): construct a `DrumPad` with a stub `IInstrument` that records `Trig`/`Randomize` calls; verify the pad drives it correctly without depending on any concrete instrument.
 
 ## Critical Files to Create
@@ -388,7 +415,7 @@ All new — no existing files are modified:
 - `Software/DrumMachine/src/util/LedTrigger.{h,cpp}`
 - `Software/DrumMachine/test/support/{test_macros.h, MockButton.{h,cpp}, MockLed.{h,cpp}, MockRng.{h,cpp}, TestRig.{h,cpp}}`
 - `Software/DrumMachine/test/main_test.cpp`
-- `Software/DrumMachine/test/test_*.cpp` (seven files listed in layout)
+- `Software/DrumMachine/test/test_*.cpp` (eight files: the seven listed in layout plus `test_restore_previous.cpp`)
 
 ### README Contents
 
@@ -422,7 +449,7 @@ End-to-end checks the implementer (or an AI agent) runs after building:
 3. **Manual hardware smoke test** (out of scope for AI agents, listed for completeness):
    - Press each button → corresponding LED flashes and drum sound plays.
    - Press the same button rapidly → sound varies on each press (randomization is working) and stays in-genre.
-   - Hold any button >500 ms → LED double-blinks confirm pattern; subsequent presses produce identical sounds (randomization disabled). Hold again → variation returns.
+   - Hold any button >500 ms → LED double-blinks confirm pattern; subsequent presses produce identical sounds matching what was heard on the press *before* the hold (randomization disabled, locked to the prior-press sound). Hold again → variation returns.
    - Press all four buttons simultaneously → all four sounds play, no audible clipping.
    - Power on with a finger held on any button → that drum does **not** fire on boot; releasing and pressing it triggers normally.
 

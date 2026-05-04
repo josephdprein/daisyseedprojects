@@ -34,6 +34,7 @@ public:
     void  Trig() override;
     float Process() override;
     void  Randomize(IRng& rng) override;
+    void  RestorePreviousTrig() override;
 
 #if defined(DRUMMACHINE_HOST_TEST)
     // Test-only: returns the most-recently-applied randomized parameter values.
@@ -52,6 +53,11 @@ private:
     daisysp::AnalogBassDrum                voice_;
     RandomizationProfile<kNumRandomized>   profile_;
     std::array<float, kNumRandomized>      current_{};
+    // Two-deep history of params used by past Trig() calls. Shifted at the
+    // top of every Trig(): prev_prev_ ← prev_, prev_ ← current_. Used by
+    // RestorePreviousTrig to roll back to the params heard one press ago.
+    std::array<float, kNumRandomized>      prev_{};
+    std::array<float, kNumRandomized>      prev_prev_{};
     float                                  depth_   = 0.0f;
     float                                  accent_  = 0.7f;
 };

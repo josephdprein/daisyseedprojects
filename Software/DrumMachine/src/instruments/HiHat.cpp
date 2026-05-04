@@ -32,6 +32,8 @@ void HiHat::Init(float sampleRate, float depth01) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = profile_.params[i].baseline;
     }
+    prev_      = current_;
+    prev_prev_ = current_;
 
     voice_.SetFreq(current_[0]);
     voice_.SetDecay(current_[1]);
@@ -42,6 +44,8 @@ void HiHat::Init(float sampleRate, float depth01) {
 }
 
 void HiHat::Trig() {
+    prev_prev_ = prev_;
+    prev_      = current_;
     voice_.Trig();
 }
 
@@ -53,6 +57,14 @@ void HiHat::Randomize(IRng& rng) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = ApplyDepth(profile_.params[i], rng.NextFloat(), depth_);
     }
+    voice_.SetFreq(current_[0]);
+    voice_.SetDecay(current_[1]);
+    voice_.SetNoisiness(current_[2]);
+    voice_.SetTone(current_[3]);
+}
+
+void HiHat::RestorePreviousTrig() {
+    current_ = prev_prev_;
     voice_.SetFreq(current_[0]);
     voice_.SetDecay(current_[1]);
     voice_.SetNoisiness(current_[2]);

@@ -32,6 +32,9 @@ void Snare::Init(float sampleRate, float depth01) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = profile_.params[i].baseline;
     }
+    // Seed the two-deep Trig() history (see BassDrum.cpp for the contract).
+    prev_      = current_;
+    prev_prev_ = current_;
 
     voice_.SetFreq(current_[0]);
     voice_.SetDecay(current_[1]);
@@ -42,6 +45,8 @@ void Snare::Init(float sampleRate, float depth01) {
 }
 
 void Snare::Trig() {
+    prev_prev_ = prev_;
+    prev_      = current_;
     voice_.Trig();
 }
 
@@ -53,6 +58,14 @@ void Snare::Randomize(IRng& rng) {
     for (std::size_t i = 0; i < kNumRandomized; ++i) {
         current_[i] = ApplyDepth(profile_.params[i], rng.NextFloat(), depth_);
     }
+    voice_.SetFreq(current_[0]);
+    voice_.SetDecay(current_[1]);
+    voice_.SetSnappy(current_[2]);
+    voice_.SetTone(current_[3]);
+}
+
+void Snare::RestorePreviousTrig() {
+    current_ = prev_prev_;
     voice_.SetFreq(current_[0]);
     voice_.SetDecay(current_[1]);
     voice_.SetSnappy(current_[2]);
