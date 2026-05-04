@@ -48,7 +48,10 @@ public:
     void Init();
 
     // Run one control tick. Call once per audio block at <= 2 ms.
-    void Tick(uint32_t nowMs);
+    // `pad_id` is forwarded to diag::Push so log lines can identify which
+    // pad emitted each event; 0xFF means "unknown" (used by unit tests that
+    // don't care about the diagnostic stream).
+    void Tick(uint32_t nowMs, uint8_t pad_id = 0xFF);
 
     // Test/inspection accessor. The DrumMachine engine has no public per-pad
     // accessor (per spec); this method exists for the TestRig path in task 08

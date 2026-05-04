@@ -49,7 +49,7 @@ void DrumMachine::Tick(uint32_t nowMs) {
     // tick all fire that tick because each Tick() calls instrument.Trig()
     // synchronously on a JustPressed edge.
     for (std::size_t i = 0; i < kNumPads; ++i) {
-        pads_[i].Tick(nowMs);
+        pads_[i].Tick(nowMs, static_cast<uint8_t>(i));
     }
 }
 

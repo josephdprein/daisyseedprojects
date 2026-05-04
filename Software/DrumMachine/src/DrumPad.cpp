@@ -6,6 +6,7 @@
 #include "DrumPad.h"
 
 #include "Config.h"
+#include "util/Diagnostic.h"
 
 namespace drum_machine {
 
@@ -23,7 +24,7 @@ void DrumPad::Init() {
     firstTickAfterInit_ = true;
 }
 
-void DrumPad::Tick(uint32_t nowMs) {
+void DrumPad::Tick(uint32_t nowMs, uint8_t pad_id) {
     button_.Update(nowMs);
 
     // Boot-stuck-button mask: if the very first Tick after Init() sees the
@@ -36,6 +37,7 @@ void DrumPad::Tick(uint32_t nowMs) {
     // triggers normally.
     if (firstTickAfterInit_ && button_.IsDown()) {
         pressMaskedUntilRelease_ = true;
+        diag::Push(diag::EvBootMaskEngaged, pad_id);
     }
     // Flip the first-tick flag now, regardless of mask outcome — task 05
     // brief: "flip it to false at the end of the first Tick regardless of
@@ -46,6 +48,7 @@ void DrumPad::Tick(uint32_t nowMs) {
     if (pressMaskedUntilRelease_) {
         if (button_.JustReleased()) {
             pressMaskedUntilRelease_ = false;
+            diag::Push(diag::EvBootMaskCleared, pad_id);
         }
         // While masked: no Trig, no Randomize, no hold-toggle, no LED
         // activity. The LED stays dark because ledTrigger_ remains in its
@@ -55,11 +58,13 @@ void DrumPad::Tick(uint32_t nowMs) {
     }
 
     if (button_.JustPressed()) {
+        diag::Push(diag::EvPress, pad_id);
         // Spec §DrumPad Behavior: Trig fires immediately on press, then we
         // re-randomize for the *next* press. holdToggleArmed is re-armed on
         // every fresh press (not just on release) so that a press → toggle →
         // release → press sequence can toggle again on the new hold.
         instrument_.Trig();
+        diag::Push(diag::EvTrig, pad_id);
         ledTrigger_.Fire(nowMs);
         if (randomizationEnabled_) {
             instrument_.Randomize(rng_);
@@ -90,6 +95,7 @@ void DrumPad::Tick(uint32_t nowMs) {
     }
 
     if (button_.JustReleased()) {
+        diag::Push(diag::EvRelease, pad_id);
         holdToggleArmed_ = false;
     }
 
